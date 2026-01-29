@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+32bit/GlueCLILib.dll
+32bit/GlueCLILib.lib
+32bit/GlueCLILib.pdb
+*.dll
+*.h
+*.lib
+*.pdb

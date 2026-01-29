@@ -10,21 +10,29 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import altair as alt
-import asyncio
 import logging
 import tempfile
 from pathlib import Path
 import json
 import time
+import threading
+
+# Install with: pip install streamlit-autorefresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
 
 # Import gluepy for context sharing
 from gluepy import (
     glue_ensure_clr,
-    initialize_glue,
     subscribe_context,
     glue_lib,
     translate_glue_value,
-    GlueState
+    GlueState,
+    GlueInitCallback,
+    active_callbacks
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +43,14 @@ st.set_page_config(
     page_icon=":chart_with_upwards_trend:",
     layout="wide",
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Auto-refresh for context updates
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Auto-refresh every 2 seconds when listening for context updates
+if HAS_AUTOREFRESH and 'context_subscribed' in st.session_state and st.session_state.context_subscribed:
+    st_autorefresh(interval=2000, limit=None, key="context_autorefresh")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
@@ -108,29 +124,56 @@ def init_glue_sync():
             logger.error(f"Failed to initialize CLR: {result}")
             return False
 
-        # Run async init in a new event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # We need to manually replicate what initialize_glue does,
+        # but in a synchronous way suitable for Streamlit
 
-        try:
-            init_future = initialize_glue(
-                "StockPeerAnalysis",
-                on_state_change=lambda state, msg: logger.info(
-                    f"Glue state: {state} - {msg}")
-            )
-            result = loop.run_until_complete(
-                asyncio.wait_for(init_future, timeout=10.0))
+        import threading
 
-            if result:
+        init_result = {'success': False, 'done': False}
+        init_event = threading.Event()
+
+        def glue_init_callback(state, message, glue_payload, cookie):
+            decoded_message = message.decode('utf-8') if message else ""
+            logger.info(f"Glue state: {state} - {decoded_message}")
+
+            if state == GlueState.INITIALIZED:
+                init_result['success'] = True
+                init_result['done'] = True
+                init_event.set()
+            elif state == GlueState.DISCONNECTED:
+                init_result['success'] = False
+                init_result['done'] = True
+                init_event.set()
+
+        # Create the callback - need to keep reference alive
+        from gluepy import GlueInitCallback, glue_lib, active_callbacks
+
+        callback_instance = GlueInitCallback(glue_init_callback)
+        active_callbacks.append(callback_instance)  # Keep alive
+
+        # Call glue_init
+        result = glue_lib.glue_init(
+            b"StockPeerAnalysis", callback_instance, None)
+
+        if result != 0:
+            logger.error(f"glue_init returned error: {result}")
+            active_callbacks.remove(callback_instance)
+            return False
+
+        # Wait for initialization with timeout
+        if init_event.wait(timeout=10.0):
+            if init_result['success']:
                 st.session_state.glue_initialized = True
                 logger.info("Glue initialized successfully")
                 return True
             else:
-                logger.error("Glue initialization returned False")
+                logger.error("Glue initialization failed (disconnected)")
+                active_callbacks.remove(callback_instance)
                 return False
-
-        finally:
-            loop.close()
+        else:
+            logger.error("Glue initialization timed out")
+            active_callbacks.remove(callback_instance)
+            return False
 
     except Exception as e:
         logger.error(f"Error initializing Glue: {e}")
@@ -259,6 +302,12 @@ with st.sidebar:
                     st.error("Failed to subscribe")
         else:
             st.success(f"✓ Listening to `{INSTRUMENT_CONTEXT}`")
+
+            if HAS_AUTOREFRESH:
+                st.caption("🔄 Auto-refresh: Active (2s)")
+            else:
+                st.warning("Install `streamlit-autorefresh` for auto-updates")
+                st.code("pip install streamlit-autorefresh", language="bash")
 
             if st.session_state.received_ric:
                 st.info(f"Last received: **{st.session_state.received_ric}**")
@@ -402,36 +451,53 @@ except yf.exceptions.YFRateLimitError as e:
     load_data.clear()
     st.stop()
 
+# Check for completely empty columns (tickers with no data at all)
 empty_columns = data.columns[data.isna().all()].tolist()
 
 if empty_columns:
-    st.error(
-        f"Error loading data for the tickers: {', '.join(empty_columns)}.")
-    st.stop()
+    st.warning(
+        f"Could not load data for: {', '.join(empty_columns)}. These tickers may not exist in Yahoo Finance.")
+    # Remove the problematic tickers from the data
+    data = data.drop(columns=empty_columns)
+    # Also filter them from the tickers list for downstream processing
+    tickers = [t for t in tickers if t not in empty_columns]
+
+    if data.empty or len(tickers) == 0:
+        st.error("No valid stock data available.")
+        st.stop()
 
 normalized = data.div(data.iloc[0])
 
-latest_norm_values = {normalized[ticker].iat[-1]: ticker for ticker in tickers}
-max_norm_value = max(latest_norm_values.items())
-min_norm_value = min(latest_norm_values.items())
+# Filter out NaN values when calculating best/worst
+latest_norm_values = {}
+for ticker in tickers:
+    val = normalized[ticker].iat[-1]
+    if pd.notna(val):  # Only include non-NaN values
+        latest_norm_values[val] = ticker
 
 bottom_left_cell = cols[0].container(
     border=True, height="stretch", vertical_alignment="center")
 
 with bottom_left_cell:
-    metric_cols = st.columns(2)
-    metric_cols[0].metric(
-        "Best stock",
-        max_norm_value[1],
-        delta=f"{round(max_norm_value[0] * 100)}%",
-        width="content",
-    )
-    metric_cols[1].metric(
-        "Worst stock",
-        min_norm_value[1],
-        delta=f"{round(min_norm_value[0] * 100)}%",
-        width="content",
-    )
+    if latest_norm_values:
+        max_norm_value = max(latest_norm_values.items())
+        min_norm_value = min(latest_norm_values.items())
+
+        metric_cols = st.columns(2)
+        metric_cols[0].metric(
+            "Best stock",
+            max_norm_value[1],
+            delta=f"{round(max_norm_value[0] * 100)}%",
+            width="content",
+        )
+        metric_cols[1].metric(
+            "Worst stock",
+            min_norm_value[1],
+            delta=f"{round(min_norm_value[0] * 100)}%",
+            width="content",
+        )
+    else:
+        st.warning("No valid stock data available")
 
 
 with right_cell:
