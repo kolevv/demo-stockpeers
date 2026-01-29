@@ -1,22 +1,34 @@
 # -*- coding: utf-8 -*-
-# Copyright 2024-2025 Streamlit Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+Stock peer analysis dashboard - With Glue Context Integration
+
+Subscribes to SelectedInstrument context from the Excel demo app.
+When an instrument is selected there, it gets added to the tickers here.
+"""
 
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import altair as alt
+import asyncio
+import logging
+import tempfile
+from pathlib import Path
+import json
+import time
+
+# Import gluepy for context sharing
+from gluepy import (
+    glue_ensure_clr,
+    initialize_glue,
+    subscribe_context,
+    glue_lib,
+    translate_glue_value,
+    GlueState
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="Stock peer analysis dashboard",
@@ -24,113 +36,272 @@ st.set_page_config(
     layout="wide",
 )
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════════════
+
+INSTRUMENT_CONTEXT = "SelectedInstrument"
+
+# File-based IPC for cross-thread context updates
+CONTEXT_TRIGGER_FILE = Path(tempfile.gettempdir()) / \
+    "glue_context_trigger.json"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session State Initialization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if 'glue_initialized' not in st.session_state:
+    st.session_state.glue_initialized = False
+if 'context_subscribed' not in st.session_state:
+    st.session_state.context_subscribed = False
+if 'received_ric' not in st.session_state:
+    st.session_state.received_ric = None
+if 'last_context_timestamp' not in st.session_state:
+    st.session_state.last_context_timestamp = 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Glue Initialization and Context Subscription
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def write_context_signal(ric: str):
+    """Write received RIC to file (called from callback thread)."""
+    try:
+        with open(CONTEXT_TRIGGER_FILE, 'w') as f:
+            json.dump({'ric': ric, 'timestamp': time.time()}, f)
+        logger.info(f"Context signal written: {ric}")
+    except Exception as e:
+        logger.error(f"Error writing context signal: {e}")
+
+
+def read_context_signal() -> tuple[str, float]:
+    """Read RIC from file (called from main thread)."""
+    try:
+        if CONTEXT_TRIGGER_FILE.exists():
+            with open(CONTEXT_TRIGGER_FILE, 'r') as f:
+                data = json.load(f)
+            return data.get('ric'), data.get('timestamp', 0)
+    except Exception as e:
+        logger.error(f"Error reading context signal: {e}")
+    return None, 0
+
+
+def context_callback(context_name: str, field_path: str, value):
+    """
+    Callback when the SelectedInstrument context changes.
+    This runs in a different thread, so we write to a file.
+    """
+    logger.info(f"Context update: {context_name}.{field_path} = {value}")
+    if value:
+        write_context_signal(str(value))
+
+
+def init_glue_sync():
+    """Initialize Glue synchronously for Streamlit."""
+    if st.session_state.glue_initialized:
+        return True
+
+    try:
+        # Ensure CLR is loaded
+        result = glue_ensure_clr()
+        if result != 0:
+            logger.error(f"Failed to initialize CLR: {result}")
+            return False
+
+        # Run async init in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            init_future = initialize_glue(
+                "StockPeerAnalysis",
+                on_state_change=lambda state, msg: logger.info(
+                    f"Glue state: {state} - {msg}")
+            )
+            result = loop.run_until_complete(
+                asyncio.wait_for(init_future, timeout=10.0))
+
+            if result:
+                st.session_state.glue_initialized = True
+                logger.info("Glue initialized successfully")
+                return True
+            else:
+                logger.error("Glue initialization returned False")
+                return False
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"Error initializing Glue: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+
+def setup_context_subscription():
+    """Subscribe to the SelectedInstrument context."""
+    if st.session_state.context_subscribed:
+        return True
+
+    if not st.session_state.glue_initialized:
+        return False
+
+    try:
+        # Subscribe to the "ric" field in the SelectedInstrument context
+        unsubscribe = subscribe_context(
+            INSTRUMENT_CONTEXT,
+            "ric",
+            context_callback
+        )
+        st.session_state.context_subscribed = True
+        logger.info(f"Subscribed to context: {INSTRUMENT_CONTEXT}.ric")
+
+        # Also try to read current value
+        try:
+            ctx_reader = glue_lib.glue_read_context_sync(
+                INSTRUMENT_CONTEXT.encode("utf-8"))
+            if ctx_reader:
+                value = glue_lib.glue_read_glue_value(ctx_reader, b"ric")
+                current_ric = translate_glue_value(value)
+                if current_ric:
+                    logger.info(f"Current context value: {current_ric}")
+                    write_context_signal(current_ric)
+        except Exception as e:
+            logger.warning(f"Could not read current context value: {e}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Error subscribing to context: {e}")
+        return False
+
+
+def check_for_context_updates() -> str:
+    """Check if there's a new RIC from context. Returns the RIC or None."""
+    ric, timestamp = read_context_signal()
+
+    if timestamp > st.session_state.last_context_timestamp:
+        st.session_state.last_context_timestamp = timestamp
+        if ric:
+            logger.info(f"New context RIC detected: {ric}")
+            return ric
+    return None
+
+
+def ric_to_ticker(ric: str) -> str:
+    """
+    Convert a RIC (e.g., VOD:LN) to a Yahoo Finance ticker.
+
+    Common mappings:
+    - :LN (London) -> .L
+    - :GR (Germany) -> .DE
+    - US stocks usually have no suffix
+    """
+    if not ric:
+        return None
+
+    ric = ric.upper().strip()
+
+    # Common RIC to Yahoo ticker mappings
+    suffix_map = {
+        ":LN": ".L",      # London Stock Exchange
+        ":GR": ".DE",     # Germany (Xetra)
+        ":FP": ".PA",     # France (Paris)
+        ":NA": ".AS",     # Netherlands (Amsterdam)
+        ":SM": ".MC",     # Spain (Madrid)
+        ":IM": ".MI",     # Italy (Milan)
+        ":SW": ".SW",     # Switzerland
+        ":AV": ".VI",     # Austria (Vienna)
+        ":BB": ".BR",     # Belgium (Brussels)
+        ":JP": ".T",      # Japan (Tokyo)
+        ":HK": ".HK",     # Hong Kong
+        ":AU": ".AX",     # Australia
+        ":CN": ".TO",     # Canada (Toronto)
+    }
+
+    for ric_suffix, yahoo_suffix in suffix_map.items():
+        if ric.endswith(ric_suffix):
+            base = ric[:-len(ric_suffix)]
+            return base + yahoo_suffix
+
+    # If no suffix match, assume it's a US ticker or return as-is
+    if ":" in ric:
+        return ric.split(":")[0]
+
+    return ric
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sidebar - Glue Connection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.subheader("🔗 io.Connect Integration")
+
+    if not st.session_state.glue_initialized:
+        if st.button("Initialize Glue", type="primary", use_container_width=True):
+            with st.spinner("Initializing Glue..."):
+                if init_glue_sync():
+                    st.success("Glue initialized!")
+                    st.rerun()
+                else:
+                    st.error("Failed to initialize Glue")
+    else:
+        st.success("✓ Glue Connected")
+
+        if not st.session_state.context_subscribed:
+            if st.button("Subscribe to Context", use_container_width=True):
+                if setup_context_subscription():
+                    st.success("Subscribed!")
+                    st.rerun()
+                else:
+                    st.error("Failed to subscribe")
+        else:
+            st.success(f"✓ Listening to `{INSTRUMENT_CONTEXT}`")
+
+            if st.session_state.received_ric:
+                st.info(f"Last received: **{st.session_state.received_ric}**")
+
+    st.divider()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Check for context updates and add to tickers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+new_ric = None
+if st.session_state.context_subscribed:
+    new_ric = check_for_context_updates()
+    if new_ric:
+        st.session_state.received_ric = new_ric
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main App Content
+# ═══════════════════════════════════════════════════════════════════════════════
+
 """
 # :material/query_stats: Stock peer analysis
 
 Easily compare stocks against others in their peer group.
 """
 
-""  # Add some space.
+""
 
 cols = st.columns([1, 3])
-# Will declare right cell later to avoid showing it when no data.
 
 STOCKS = [
-    "AAPL",
-    "ABBV",
-    "ACN",
-    "ADBE",
-    "ADP",
-    "AMD",
-    "AMGN",
-    "AMT",
-    "AMZN",
-    "APD",
-    "AVGO",
-    "AXP",
-    "BA",
-    "BK",
-    "BKNG",
-    "BMY",
-    "BRK.B",
-    "BSX",
-    "C",
-    "CAT",
-    "CI",
-    "CL",
-    "CMCSA",
-    "COST",
-    "CRM",
-    "CSCO",
-    "CVX",
-    "DE",
-    "DHR",
-    "DIS",
-    "DUK",
-    "ELV",
-    "EOG",
-    "EQR",
-    "FDX",
-    "GD",
-    "GE",
-    "GILD",
-    "GOOG",
-    "GOOGL",
-    "HD",
-    "HON",
-    "HUM",
-    "IBM",
-    "ICE",
-    "INTC",
-    "ISRG",
-    "JNJ",
-    "JPM",
-    "KO",
-    "LIN",
-    "LLY",
-    "LMT",
-    "LOW",
-    "MA",
-    "MCD",
-    "MDLZ",
-    "META",
-    "MMC",
-    "MO",
-    "MRK",
-    "MSFT",
-    "NEE",
-    "NFLX",
-    "NKE",
-    "NOW",
-    "NVDA",
-    "ORCL",
-    "PEP",
-    "PFE",
-    "PG",
-    "PLD",
-    "PM",
-    "PSA",
-    "REGN",
-    "RTX",
-    "SBUX",
-    "SCHW",
-    "SLB",
-    "SO",
-    "SPGI",
-    "T",
-    "TJX",
-    "TMO",
-    "TSLA",
-    "TXN",
-    "UNH",
-    "UNP",
-    "UPS",
-    "V",
-    "VZ",
-    "WFC",
-    "WM",
-    "WMT",
-    "XOM",
+    "AAPL", "ABBV", "ACN", "ADBE", "ADP", "AMD", "AMGN", "AMT", "AMZN", "APD",
+    "AVGO", "AXP", "BA", "BK", "BKNG", "BMY", "BRK.B", "BSX", "C", "CAT",
+    "CI", "CL", "CMCSA", "COST", "CRM", "CSCO", "CVX", "DE", "DHR", "DIS",
+    "DUK", "ELV", "EOG", "EQR", "FDX", "GD", "GE", "GILD", "GOOG", "GOOGL",
+    "HD", "HON", "HUM", "IBM", "ICE", "INTC", "ISRG", "JNJ", "JPM", "KO",
+    "LIN", "LLY", "LMT", "LOW", "MA", "MCD", "MDLZ", "META", "MMC", "MO",
+    "MRK", "MSFT", "NEE", "NFLX", "NKE", "NOW", "NVDA", "ORCL", "PEP", "PFE",
+    "PG", "PLD", "PM", "PSA", "REGN", "RTX", "SBUX", "SCHW", "SLB", "SO",
+    "SPGI", "T", "TJX", "TMO", "TSLA", "TXN", "UNH", "UNP", "UPS", "V",
+    "VZ", "WFC", "WM", "WMT", "XOM",
 ]
 
 DEFAULT_STOCKS = ["AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "TSLA", "META"]
@@ -146,20 +317,34 @@ if "tickers_input" not in st.session_state:
     ).split(",")
 
 
-# Callback to update query param when input changes
+# If we received a new RIC from context, convert and add it
+if new_ric:
+    yahoo_ticker = ric_to_ticker(new_ric)
+    if yahoo_ticker:
+        logger.info(
+            f"Converting RIC {new_ric} to Yahoo ticker: {yahoo_ticker}")
+        # Add to the list if not already present
+        if yahoo_ticker.upper() not in [t.upper() for t in st.session_state.tickers_input]:
+            st.session_state.tickers_input.append(yahoo_ticker.upper())
+            st.toast(f"📥 Added {yahoo_ticker} from {new_ric}", icon="✅")
+
+
 def update_query_param():
     if st.session_state.tickers_input:
-        st.query_params["stocks"] = stocks_to_str(st.session_state.tickers_input)
+        st.query_params["stocks"] = stocks_to_str(
+            st.session_state.tickers_input)
     else:
         st.query_params.pop("stocks", None)
 
 
 top_left_cell = cols[0].container(
-    border=True, height="stretch", vertical_alignment="center"
-)
+    border=True, height="stretch", vertical_alignment="center")
 
 with top_left_cell:
-    # Selectbox for stock tickers
+    # Show context integration status
+    if st.session_state.context_subscribed:
+        st.caption("🔗 Listening for instruments from io.Connect")
+
     tickers = st.multiselect(
         "Stock tickers",
         options=sorted(set(STOCKS) | set(st.session_state.tickers_input)),
@@ -168,7 +353,6 @@ with top_left_cell:
         accept_new_options=True,
     )
 
-# Time horizon selector
 horizon_map = {
     "1 Months": "1mo",
     "3 Months": "3mo",
@@ -180,7 +364,6 @@ horizon_map = {
 }
 
 with top_left_cell:
-    # Buttons for picking time horizon
     horizon = st.pills(
         "Time horizon",
         options=list(horizon_map.keys()),
@@ -189,11 +372,9 @@ with top_left_cell:
 
 tickers = [t.upper() for t in tickers]
 
-# Update query param when text input changes
 if tickers:
     st.query_params["stocks"] = stocks_to_str(tickers)
 else:
-    # Clear the param if input is empty
     st.query_params.pop("stocks", None)
 
 if not tickers:
@@ -202,8 +383,7 @@ if not tickers:
 
 
 right_cell = cols[1].container(
-    border=True, height="stretch", vertical_alignment="center"
-)
+    border=True, height="stretch", vertical_alignment="center")
 
 
 @st.cache_resource(show_spinner=False, ttl="6h")
@@ -215,21 +395,20 @@ def load_data(tickers, period):
     return data["Close"]
 
 
-# Load the data
 try:
     data = load_data(tickers, horizon_map[horizon])
 except yf.exceptions.YFRateLimitError as e:
     st.warning("YFinance is rate-limiting us :(\nTry again later.")
-    load_data.clear()  # Remove the bad cache entry.
+    load_data.clear()
     st.stop()
 
 empty_columns = data.columns[data.isna().all()].tolist()
 
 if empty_columns:
-    st.error(f"Error loading data for the tickers: {', '.join(empty_columns)}.")
+    st.error(
+        f"Error loading data for the tickers: {', '.join(empty_columns)}.")
     st.stop()
 
-# Normalize prices (start at 1)
 normalized = data.div(data.iloc[0])
 
 latest_norm_values = {normalized[ticker].iat[-1]: ticker for ticker in tickers}
@@ -237,18 +416,17 @@ max_norm_value = max(latest_norm_values.items())
 min_norm_value = min(latest_norm_values.items())
 
 bottom_left_cell = cols[0].container(
-    border=True, height="stretch", vertical_alignment="center"
-)
+    border=True, height="stretch", vertical_alignment="center")
 
 with bottom_left_cell:
-    cols = st.columns(2)
-    cols[0].metric(
+    metric_cols = st.columns(2)
+    metric_cols[0].metric(
         "Best stock",
         max_norm_value[1],
         delta=f"{round(max_norm_value[0] * 100)}%",
         width="content",
     )
-    cols[1].metric(
+    metric_cols[1].metric(
         "Worst stock",
         min_norm_value[1],
         delta=f"{round(min_norm_value[0] * 100)}%",
@@ -256,7 +434,6 @@ with bottom_left_cell:
     )
 
 
-# Plot normalized prices
 with right_cell:
     st.altair_chart(
         alt.Chart(
@@ -276,7 +453,6 @@ with right_cell:
 ""
 ""
 
-# Plot individual stock vs peer average
 """
 ## Individual stocks vs peer average
 
@@ -289,14 +465,12 @@ if len(tickers) <= 1:
     st.stop()
 
 NUM_COLS = 4
-cols = st.columns(NUM_COLS)
+chart_cols = st.columns(NUM_COLS)
 
 for i, ticker in enumerate(tickers):
-    # Calculate peer average (excluding current stock)
     peers = normalized.drop(columns=[ticker])
     peer_avg = peers.mean(axis=1)
 
-    # Create DataFrame with peer average.
     plot_data = pd.DataFrame(
         {
             "Date": normalized.index,
@@ -313,7 +487,8 @@ for i, ticker in enumerate(tickers):
             alt.Y("Price:Q").scale(zero=False),
             alt.Color(
                 "Series:N",
-                scale=alt.Scale(domain=[ticker, "Peer average"], range=["red", "gray"]),
+                scale=alt.Scale(
+                    domain=[ticker, "Peer average"], range=["red", "gray"]),
                 legend=alt.Legend(orient="bottom"),
             ),
             alt.Tooltip(["Date", "Series", "Price"]),
@@ -321,11 +496,10 @@ for i, ticker in enumerate(tickers):
         .properties(title=f"{ticker} vs peer average", height=300)
     )
 
-    cell = cols[(i * 2) % NUM_COLS].container(border=True)
+    cell = chart_cols[(i * 2) % NUM_COLS].container(border=True)
     cell.write("")
     cell.altair_chart(chart, use_container_width=True)
 
-    # Create Delta chart
     plot_data = pd.DataFrame(
         {
             "Date": normalized.index,
@@ -343,7 +517,7 @@ for i, ticker in enumerate(tickers):
         .properties(title=f"{ticker} minus peer average", height=300)
     )
 
-    cell = cols[(i * 2 + 1) % NUM_COLS].container(border=True)
+    cell = chart_cols[(i * 2 + 1) % NUM_COLS].container(border=True)
     cell.write("")
     cell.altair_chart(chart, use_container_width=True)
 
