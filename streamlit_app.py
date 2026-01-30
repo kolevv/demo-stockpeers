@@ -31,6 +31,12 @@ from gluepy import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize CLR early (before any UI) - this needs to happen once
+try:
+    glue_ensure_clr()
+except Exception as e:
+    logger.warning(f"CLR initialization: {e}")
+
 st.set_page_config(
     page_title="Stock Chart",
     page_icon=":chart_with_upwards_trend:",
@@ -63,6 +69,8 @@ STOCKS = [
 
 if 'glue_initialized' not in st.session_state:
     st.session_state.glue_initialized = False
+if 'glue_init_attempted' not in st.session_state:
+    st.session_state.glue_init_attempted = False
 if 'last_ric' not in st.session_state:
     st.session_state.last_ric = None
 if 'stock_selector' not in st.session_state:
@@ -98,50 +106,76 @@ def read_context_ric() -> str:
     return None
 
 
+# Global to keep callback alive for the lifetime of the app
+_glue_init_callback_ref = None
+_glue_init_event = None
+_glue_init_result = {'success': False}
+
+
 def init_glue_sync():
     """Initialize Glue synchronously for Streamlit."""
+    global _glue_init_callback_ref, _glue_init_event, _glue_init_result
+
     if st.session_state.glue_initialized:
         return True
 
-    try:
-        result = glue_ensure_clr()
-        if result != 0:
-            logger.error(f"Failed to initialize CLR: {result}")
-            return False
+    # If we already attempted, check if it succeeded in the background
+    if st.session_state.glue_init_attempted:
+        if _glue_init_result.get('success'):
+            st.session_state.glue_initialized = True
+            return True
+        return False
 
+    st.session_state.glue_init_attempted = True
+
+    try:
         import threading
-        init_result = {'success': False}
-        init_event = threading.Event()
+
+        _glue_init_event = threading.Event()
+        _glue_init_result['success'] = False
 
         def glue_init_callback(state, message, glue_payload, cookie):
             decoded_message = message.decode('utf-8') if message else ""
-            logger.info(f"Glue state: {state} - {decoded_message}")
+            logger.info(f"Glue callback - state: {state}, message: {decoded_message}")
 
-            if state == GlueState.INITIALIZED:
-                init_result['success'] = True
-                init_event.set()
-            elif state == GlueState.DISCONNECTED:
-                init_event.set()
+            # INITIALIZED = 3
+            if state == 3:
+                _glue_init_result['success'] = True
+                _glue_init_event.set()
+            # DISCONNECTED = 4
+            elif state == 4:
+                _glue_init_event.set()
 
-        callback_instance = GlueInitCallback(glue_init_callback)
-        active_callbacks.append(callback_instance)
+        # Create callback and keep it alive FOREVER
+        _glue_init_callback_ref = GlueInitCallback(glue_init_callback)
+        active_callbacks.append(_glue_init_callback_ref)
 
-        result = glue_lib.glue_init(b"StockChart", callback_instance, None)
+        logger.info("Calling glue_init...")
+        result = glue_lib.glue_init(b"StockChart", _glue_init_callback_ref, None)
+        logger.info(f"glue_init returned: {result}")
+
         if result != 0:
             logger.error(f"glue_init returned error: {result}")
-            active_callbacks.remove(callback_instance)
             return False
 
-        if init_event.wait(timeout=10.0) and init_result['success']:
-            st.session_state.glue_initialized = True
-            logger.info("Glue initialized successfully")
-            return True
-
-        active_callbacks.remove(callback_instance)
-        return False
+        # Wait for initialization
+        logger.info("Waiting for Glue initialization (30s timeout)...")
+        if _glue_init_event.wait(timeout=30.0):
+            if _glue_init_result['success']:
+                st.session_state.glue_initialized = True
+                logger.info("Glue initialized successfully")
+                return True
+            else:
+                logger.warning("Glue initialization failed")
+                return False
+        else:
+            logger.warning("Glue initialization timed out")
+            return False
 
     except Exception as e:
         logger.error(f"Error initializing Glue: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 
