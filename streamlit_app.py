@@ -279,14 +279,18 @@ st.title("📈 Stock Price Chart")
 # Stock selector - builds options list including current selection
 all_options = sorted(set(STOCKS) | {st.session_state.stock_selector})
 
-st.selectbox(
+# Ensure selected ticker is valid before rendering selectbox
+if st.session_state.stock_selector not in all_options:
+    st.session_state.stock_selector = DEFAULT_TICKER
+
+ticker = st.selectbox(
     "Select Stock",
     options=all_options,
-    index=all_options.index(st.session_state.stock_selector) if st.session_state.stock_selector in all_options else 0,
-    key="stock_selector"
+    index=all_options.index(st.session_state.stock_selector),
 )
 
-ticker = st.session_state.stock_selector
+# Update session state with selection
+st.session_state.stock_selector = ticker
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Load and Display Data
